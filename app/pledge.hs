@@ -6,17 +6,18 @@ import Control.Monad        (replicateM)
 import Control.Monad.Random (MonadRandom (..))
 import Data.Foldable
 import Data.Function        (on)
-import Data.List            (sort, sortBy)
+import Data.List            (sortBy, unfoldr)
 import Numeric.Natural      (Natural)
 import Text.Printf          (printf)
 
 data Config = Config
-    { cfgN           :: !Int    -- ^ number of players
-    , cfgK           :: !Int    -- ^ desired number of pools
-    , cfgA0          :: !Double -- ^ pool stake versus leader stake
-    , cfgMinCost     :: !Double -- ^ minimal player cost
-    , cfgMaxCost     :: !Double -- ^ maximal player cost
-    , cfgParetoAlpha :: !Double -- ^ Pareto alpha
+    { cfgN              :: !Int      -- ^ number of players
+    , cfgK              :: !Int      -- ^ desired number of pools
+    , cfgA0             :: !Double   -- ^ pool stake versus leader stake
+    , cfgMinCost        :: !Double   -- ^ minimal player cost
+    , cfgMaxCost        :: !Double   -- ^ maximal player cost
+    , cfgParetoAlpha    :: !Double   -- ^ Pareto alpha
+    , cfgWhaleThreshold :: !Rational -- ^ threshold of stake for a whale
     } deriving (Show, Read, Eq, Ord)
 
 data Player = Player
@@ -40,14 +41,12 @@ mkPlayers cfg = do
         mc  = getRandomR (cfgMinCost cfg, cfgMaxCost cfg)
     ws <- replicateM n mw
     cs <- replicateM n mc
-    let cc  = sort cs !! k
-        potential lam c = (z0 + a0 * lam) / (1 + a0) - c
+    let potential lam c = (z0 + a0 * lam) / (1 + a0) - c
         q               = fromIntegral (sum ws)
         ws'             = [fromIntegral w / q | w <- ws]
         wcs             = zip ws' cs
         h (w, c)        = - (potential (fromRational w) c)
         wcs'            = sortBy (compare `on` h) wcs
-        g i (w, c)      = (i, Player w c)
         ps              = uncurry Player <$> wcs'
     return ps
 
@@ -62,20 +61,22 @@ main = pledge
     6000
     20000
     1.16
+    0.0005
     0.1
 
-pledge :: Natural -- ^ number of ada holders
-       -> Natural -- ^ pool count
-       -> Double  -- ^ days per epoch
-       -> Double  -- ^ ada in circulation
-       -> Double  -- ^ ada rewards per day
-       -> Double  -- ^ dollars per ada
-       -> Double  -- ^ min cost dollars per year
-       -> Double  -- ^ max cost dollars per year
-       -> Double  -- ^ Pareto alpha
-       -> Double  -- ^ pledge influence
+pledge :: Natural  -- ^ number of ada holders
+       -> Natural  -- ^ pool count
+       -> Double   -- ^ days per epoch
+       -> Double   -- ^ ada in circulation
+       -> Double   -- ^ ada rewards per day
+       -> Double   -- ^ dollars per ada
+       -> Double   -- ^ min cost dollars per year
+       -> Double   -- ^ max cost dollars per year
+       -> Double   -- ^ Pareto alpha
+       -> Rational -- ^ whale threshold
+       -> Double   -- ^ pledge influence
        -> IO ()
-pledge adaHolders poolCount daysPerEpoch adaInCirculation adaRewardsPerDay dollarsPerAda minCostDollarsPerYear maxCostDollarsPerYear paretoAlpha a0  = do
+pledge adaHolders poolCount daysPerEpoch adaInCirculation adaRewardsPerDay dollarsPerAda minCostDollarsPerYear maxCostDollarsPerYear paretoAlpha whaleThreshold a0  = do
     printf "number of ada holders:     %11d\n"   adaHolders
     printf "number of pools:           %11d\n"   poolCount
     printf "days per epoch:            %13.1f\n" daysPerEpoch
@@ -85,6 +86,7 @@ pledge adaHolders poolCount daysPerEpoch adaInCirculation adaRewardsPerDay dolla
     printf "min dollars cost per year: %11.0f\n" minCostDollarsPerYear
     printf "max dollars cost per year: %11.0f\n" maxCostDollarsPerYear
     printf "Pareto alpha:              %14.2f\n" paretoAlpha
+    printf "Whale threshold:           %14.2f\n" (fromRational whaleThreshold :: Double)
     printf "pledge influence:          %14.2f\n" a0
     printf "\n"
     printf "ada rewards per epoch:     %11.0f\n" adaRewardsPerEpoch
@@ -94,30 +96,38 @@ pledge adaHolders poolCount daysPerEpoch adaInCirculation adaRewardsPerDay dolla
 
     ps <- mkPlayers cfg
 
-    let whales     = [p | p <- ps, plStake p >= z0 / 10]
-        operators' = take (succ $ fromIntegral poolCount) $ drop (length whales) $ toList ps
-        loser      = last operators'
-        operators  = take (fromIntegral poolCount) operators'
-        oms        = [(p, margin p loser) | p <- operators]
-        richest    = maximumBy (compare `on` plStake) operators
-        poorest    = minimumBy (compare `on` plStake) operators
+    let nonWhales  = [p | p <- ps, plStake p < cfgWhaleThreshold cfg] -- remove whales from list of players
+        nonWhales' = unfoldr f nonWhales                              -- have players with higher-than-saturation stake split their stake
+        operators' = take (succ $ fromIntegral poolCount) nonWhales'  -- consider top (k+1) players
+        loser      = last operators'                                  -- (k+1)-st player
+        operators  = take (fromIntegral poolCount) operators'         -- pick top k players as pool operators
+        oms        = [(p, margin p loser) | p <- operators]           -- players and their ideal margin
+        richest    = maximumBy (compare `on` plStake) operators       -- richest pool operator
+        poorest    = minimumBy (compare `on` plStake) operators       -- poorest pool operator
 
     printOperators oms
     printf "\n"
 
-    printf "number of whales:            %11d\n"   $ length whales
+    printf "number of whales:            %11d\n"   $ cfgN cfg - length nonWhales
     printf "richest pool operator stake: %11.0f\n" $ stakeToAda $ plStake richest
     printf "poorest pool operator stake: %11.0f\n" $ stakeToAda $ plStake poorest
   where
     cfg :: Config
     cfg = Config
-        { cfgN           = fromIntegral adaHolders
-        , cfgK           = fromIntegral poolCount
-        , cfgA0          = a0
-        , cfgMinCost     = dollarsPerYearToRelative minCostDollarsPerYear
-        , cfgMaxCost     = dollarsPerYearToRelative maxCostDollarsPerYear
-        , cfgParetoAlpha = paretoAlpha
+        { cfgN              = fromIntegral adaHolders
+        , cfgK              = fromIntegral poolCount
+        , cfgA0             = a0
+        , cfgMinCost        = dollarsPerYearToRelative minCostDollarsPerYear
+        , cfgMaxCost        = dollarsPerYearToRelative maxCostDollarsPerYear
+        , cfgWhaleThreshold = whaleThreshold
+        , cfgParetoAlpha    = paretoAlpha
         }
+
+    f :: [Player] -> Maybe (Player, [Player])
+    f []       = Nothing
+    f (p : ps)
+        | plStake p > z0 = Just (p {plStake = z0}, p {plStake = plStake p - z0} : ps)
+        | otherwise      = Just (p, ps)
 
     z0 :: Rational
     z0 = 1 / fromIntegral poolCount
