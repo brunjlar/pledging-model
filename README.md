@@ -9,4 +9,4 @@ and run with
 
         cabal run
 
-You will need to edit `app/pledge.hs` and recompile if you want to try different parameters.
+You will need to edit [`app/pledge.hs`](app/pledge.hs) and recompile if you want to try different parameters.
