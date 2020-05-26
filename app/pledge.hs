@@ -25,6 +25,7 @@ data Player = Player
     , plCost  :: !Double
     } deriving (Show, Read, Eq, Ord)
 
+-- | Randomly draw a weight from the Pareto distribution with the given alpha.
 paretoWeight :: MonadRandom m => Double -> m Int
 paretoWeight alpha = do
     u <- (1 -) <$> getRandomR (0, 1)
@@ -160,21 +161,25 @@ pledge adaHolders poolCount daysPerEpoch adaInCirculation adaRewardsPerDay dolla
                 roi   = 100 * op * epochsPerYear / (fromRational (plStake p) * adaInCirculation)
             printf "%6d    %11.0f               %5.0f                       %8.0f                              %8.0f  %8.6f                         %8.0f          %5.2f\n" i stake cost spr ppp m op roi
 
+    -- | Rewards of a fully-saturated pool, given its pledge.
     satPoolRewards :: Rational -> Double
     satPoolRewards lam =
         let lam' = fromRational $ min lam z0
             beta = fromRational z0
         in  1 / (1 + a0) * (beta + lam' * a0)
 
+    -- | Potential (i.e. rewards minus costs) of a fully-saturate pool run by the given player.
     poolPotential :: Player -> Double
     poolPotential p = satPoolRewards (plStake p) - plCost p
 
+    -- | Ideal margin for a player, given the next player below in the ranking.
     margin :: Player -> Player -> Double
     margin p q =
         let potP = poolPotential p
             potQ = poolPotential q
         in  1 - potQ / potP
 
+    -- | Profit for a pool operated by the given player with the given margin.
     operatorProfit :: Player -> Double -> Double
     operatorProfit p m =
         let ppp = poolPotential p
