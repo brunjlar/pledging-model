@@ -6,6 +6,7 @@ author:              Lars Bruenjes
 maintainer:          lars.bruenjes@iohk.io
 build-type:          Simple
 cabal-version:       >=1.10
+extra-source-files:  README.md
 
 executable pledge
   hs-source-dirs:      app
