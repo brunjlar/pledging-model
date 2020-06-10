@@ -1,3 +1,11 @@
+{-# LANGUAGE DataKinds         #-}
+{-# LANGUAGE DeriveAnyClass    #-}
+{-# LANGUAGE DeriveGeneric     #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE TypeOperators     #-}
+
 module Main
     ( main
     ) where
@@ -7,8 +15,42 @@ import Control.Monad.Random (MonadRandom (..))
 import Data.Foldable
 import Data.Function        (on)
 import Data.List            (sortBy, unfoldr)
+import Data.Maybe           (fromMaybe)
 import Numeric.Natural      (Natural)
+import Options.Generic
 import Text.Printf          (printf)
+
+data Args w = Args
+    { players   :: w ::: Maybe Natural <?> "number of players (default: 35000)"
+    , pools     :: w ::: Maybe Natural <?> "desired number of pools (default: 200)"
+    , epoch     :: w ::: Maybe Double  <?> "days per epoch (default: 5)"
+    , total     :: w ::: Maybe Double  <?> "ada in circulation (default: 31112087041.174194)"
+    , rewards   :: w ::: Maybe Double  <?> "ada rewards per day (default: 3400000)"
+    , rate      :: w ::: Maybe Double  <?> "exchange rate ($/ada) (default: 0.08)"
+    , minCost   :: w ::: Maybe Double  <?> "min cost per year ($) (default: 6000)"
+    , maxCost   :: w ::: Maybe Double  <?> "max cost per year ($) (default: 20000)"
+    , pareto    :: w ::: Maybe Double  <?> "Pareto alpha (default: 1.16)"
+    , whale     :: w ::: Maybe Double  <?> "relative whale threshold (default: 0.0005)"
+    , influence :: w ::: Maybe Double  <?> "pledge influence (default: 0.5)"
+    } deriving Generic
+
+deriving instance ParseRecord (Args Wrapped)
+
+main :: IO ()
+main = do
+    args <- unwrapRecord "Cardano Pledging Model" :: IO (Args Unwrapped)
+    pledge
+        (fromMaybe 35000              $ players   args)
+        (fromMaybe 200                $ pools     args)
+        (fromMaybe 5                  $ epoch     args)
+        (fromMaybe 31112087041.174194 $ total     args)
+        (fromMaybe 3400000            $ rewards   args)
+        (fromMaybe 0.08               $ rate      args)
+        (fromMaybe 6000               $ minCost   args)
+        (fromMaybe 20000              $ maxCost   args)
+        (fromMaybe 1.16               $ pareto    args)
+        (fromMaybe 0.0005             $ whale     args)
+        (fromMaybe 0.5                $ influence args)
 
 data Config = Config
     { cfgN              :: !Int      -- ^ number of players
@@ -51,20 +93,6 @@ mkPlayers cfg = do
         ps              = uncurry Player <$> wcs'
     return ps
 
-main :: IO ()
-main = pledge
-    35000
-    200
-    5
-    31112087041.174194
-    3400000
-    0.054084
-    6000
-    20000
-    1.16
-    0.0005
-    0.1
-
 pledge :: Natural  -- ^ number of ada holders
        -> Natural  -- ^ pool count
        -> Double   -- ^ days per epoch
@@ -74,7 +102,7 @@ pledge :: Natural  -- ^ number of ada holders
        -> Double   -- ^ min cost dollars per year
        -> Double   -- ^ max cost dollars per year
        -> Double   -- ^ Pareto alpha
-       -> Rational -- ^ whale threshold
+       -> Double   -- ^ whale threshold
        -> Double   -- ^ pledge influence
        -> IO ()
 pledge adaHolders poolCount daysPerEpoch adaInCirculation adaRewardsPerDay dollarsPerAda minCostDollarsPerYear maxCostDollarsPerYear paretoAlpha whaleThreshold a0  = do
@@ -87,7 +115,7 @@ pledge adaHolders poolCount daysPerEpoch adaInCirculation adaRewardsPerDay dolla
     printf "min dollars cost per year: %11.0f\n" minCostDollarsPerYear
     printf "max dollars cost per year: %11.0f\n" maxCostDollarsPerYear
     printf "Pareto alpha:              %14.2f\n" paretoAlpha
-    printf "Whale threshold:           %14.2f\n" (fromRational whaleThreshold :: Double)
+    printf "Whale threshold:           %16.4f\n" whaleThreshold
     printf "pledge influence:          %14.2f\n" a0
     printf "\n"
     printf "ada rewards per epoch:     %11.0f\n" adaRewardsPerEpoch
@@ -105,13 +133,19 @@ pledge adaHolders poolCount daysPerEpoch adaInCirculation adaRewardsPerDay dolla
         oms        = [(p, margin p loser) | p <- operators]           -- players and their ideal margin
         richest    = maximumBy (compare `on` plStake) operators       -- richest pool operator
         poorest    = minimumBy (compare `on` plStake) operators       -- poorest pool operator
+        middle     = operators !! div (cfgK cfg) 2                    -- middle pool operator
+        sybil      = sybilProtectionStake middle                      -- relative stake needed by a sybil attacker
 
     printOperators oms
     printf "\n"
 
-    printf "number of whales:            %11d\n"   $ cfgN cfg - length nonWhales
-    printf "richest pool operator stake: %11.0f\n" $ stakeToAda $ plStake richest
-    printf "poorest pool operator stake: %11.0f\n" $ stakeToAda $ plStake poorest
+    printf "number of whales:             %11d\n"   $ cfgN cfg - length nonWhales
+    printf "richest pool operator stake (ada) : %11.0f\n" $ stakeToAda $ plStake richest
+    printf "poorest pool operator stake (ada) : %11.0f\n" $ stakeToAda $ plStake poorest
+    printf "sybil attacker min stake    (ada) : %11.0f\n" $ stakeToAda $ sybil
+    printf "richest pool operator stake ($)   : %11.0f\n" $ dollarsPerAda * stakeToAda (plStake richest)
+    printf "poorest pool operator stake ($)   : %11.0f\n" $ dollarsPerAda * stakeToAda (plStake poorest)
+    printf "sybil attacker min stake    ($)   : %11.0f\n" $ dollarsPerAda * stakeToAda sybil
   where
     cfg :: Config
     cfg = Config
@@ -120,9 +154,15 @@ pledge adaHolders poolCount daysPerEpoch adaInCirculation adaRewardsPerDay dolla
         , cfgA0             = a0
         , cfgMinCost        = dollarsPerYearToRelative minCostDollarsPerYear
         , cfgMaxCost        = dollarsPerYearToRelative maxCostDollarsPerYear
-        , cfgWhaleThreshold = whaleThreshold
+        , cfgWhaleThreshold = toRational whaleThreshold
         , cfgParetoAlpha    = paretoAlpha
         }
+
+    sybilProtectionStake :: Player -> Rational
+    sybilProtectionStake p =
+        let l = fromRational $ plStake p
+            k = fromIntegral $ cfgK cfg
+        in  toRational $ (l - (plCost p - cfgMinCost cfg) * (1 + 1 / cfgA0 cfg)) * k / 2
 
     f :: [Player] -> Maybe (Player, [Player])
     f []       = Nothing
@@ -186,4 +226,4 @@ pledge adaHolders poolCount daysPerEpoch adaInCirculation adaRewardsPerDay dolla
             x   = m * ppp
             r   = (ppp - x) * fromRational (plStake p/ z0)
         in  x + r
-    
+
