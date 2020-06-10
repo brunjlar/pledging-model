@@ -1,21 +1,23 @@
-{-# LANGUAGE DataKinds           #-}
-{-# LANGUAGE DeriveAnyClass      #-}
-{-# LANGUAGE DeriveGeneric       #-}
-{-# LANGUAGE FlexibleInstances   #-}
-{-# LANGUAGE OverloadedStrings   #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE StandaloneDeriving  #-}
-{-# LANGUAGE TypeOperators       #-}
+{-# LANGUAGE DataKinds                  #-}
+{-# LANGUAGE DeriveAnyClass             #-}
+{-# LANGUAGE DeriveGeneric              #-}
+{-# LANGUAGE DerivingStrategies         #-}
+{-# LANGUAGE FlexibleInstances          #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE OverloadedStrings          #-}
+{-# LANGUAGE ScopedTypeVariables        #-}
+{-# LANGUAGE StandaloneDeriving         #-}
+{-# LANGUAGE TypeOperators              #-}
 
 module Main
     ( main
     ) where
 
-import Control.Monad        (replicateM)
 import Control.Monad.Random (MonadRandom (..))
+import Control.Monad.Reader
 import Data.Foldable
 import Data.Function        (on)
-import Data.List            (sortBy, unfoldr)
+import Data.List            (sortBy)
 import Data.Maybe           (fromMaybe)
 import GSL.Random.Dist
 import GSL.Random.Gen
@@ -40,42 +42,55 @@ data Args w = Args
     , influence :: w ::: Maybe Double  <?> "pledge influence (default: 0.5)"
     } deriving Generic
 
-deriving instance ParseRecord (Args Wrapped)
+data Config = Config
+    { cfgN              :: !Natural -- ^ number of players
+    , cfgK              :: !Natural -- ^ desired number of pools
+    , cfgEpoch          :: !Double  -- ^ days per epoch
+    , cfgTotal          :: !Double  -- ^ ada in circulation
+    , cfgSupply         :: !Double  -- ^ max supply of ada
+    , cfgExpansion      :: !Double  -- ^ monetary expansion per epoch
+    , cfgTreasury       :: !Double  -- ^ treasury ration
+    , cfgRate           :: !Double  -- ^ exchage rate ($/ada)
+    , cfgMinCostPerYear :: !Double  -- ^ min cost per year ($)
+    , cfgWeibullScale   :: !Double  -- ^ Weibull scale
+    , cfgWeibullShape   :: !Double  -- ^ Weibull shape
+    , cfgParetoAlpha    :: !Double  -- ^ Pareto alpha
+    , cfgWhaleThreshold :: !Double  -- ^ threshold of stake for a whale
+    , cfgA0             :: !Double  -- ^ pool stake versus leader stake
+    } deriving (Show, Read, Eq, Ord)
+
+deriving anyclass instance ParseRecord (Args Wrapped)
 
 main :: IO ()
 main = do
     args <- unwrapRecord "Cardano Pledging Model" :: IO (Args Unwrapped)
-    pledge
-        (fromMaybe 35000       $ players   args)
-        (fromMaybe 200         $ pools     args)
-        (fromMaybe 5           $ epoch     args)
-        (fromMaybe 31112483745 $ total     args)
-        (fromMaybe 45000000000 $ supply    args)
-        (fromMaybe 0.0012      $ expansion args)
-        (fromMaybe 0.1         $ treasury  args)
-        (fromMaybe 0.08        $ rate      args)
-        (fromMaybe 0           $ minCost   args)
-        (fromMaybe 8684        $ scale     args)
-        (fromMaybe 2           $ shape     args)
-        (fromMaybe 1.16        $ pareto    args)
-        (fromMaybe 0.0005      $ whale     args)
-        (fromMaybe 0.5         $ influence args)
-
-data Config = Config
-    { cfgN              :: !Int      -- ^ number of players
-    , cfgK              :: !Int      -- ^ desired number of pools
-    , cfgA0             :: !Double   -- ^ pool stake versus leader stake
-    , cfgMinCost        :: !Double   -- ^ minimal player cost
-    , cfgWeibullScale   :: !Double   -- ^ Weibull scale
-    , cfgWeibullShape   :: !Double   -- ^ Weibull shape
-    , cfgParetoAlpha    :: !Double   -- ^ Pareto alpha
-    , cfgWhaleThreshold :: !Rational -- ^ threshold of stake for a whale
-    } deriving (Show, Read, Eq, Ord)
+    runM pledge Config
+        { cfgN              = fromMaybe 35000       $ players   args
+        , cfgK              = fromMaybe 200         $ pools     args
+        , cfgEpoch          = fromMaybe 5           $ epoch     args
+        , cfgTotal          = fromMaybe 31112483745 $ total     args
+        , cfgSupply         = fromMaybe 45000000000 $ supply    args
+        , cfgExpansion      = fromMaybe 0.0012      $ expansion args
+        , cfgTreasury       = fromMaybe 0.1         $ treasury  args
+        , cfgRate           = fromMaybe 0.08        $ rate      args
+        , cfgMinCostPerYear = fromMaybe 0           $ minCost   args
+        , cfgWeibullScale   = fromMaybe 8684        $ scale     args
+        , cfgWeibullShape   = fromMaybe 2           $ shape     args
+        , cfgParetoAlpha    = fromMaybe 1.16        $ pareto    args
+        , cfgWhaleThreshold = fromMaybe 0.0005      $ whale     args
+        , cfgA0             = fromMaybe 0.5         $ influence args
+        }
 
 data Player = Player
     { plStake :: !Rational
     , plCost  :: !Double
     } deriving (Show, Read, Eq, Ord)
+
+newtype M a = M (ReaderT Config IO a)
+    deriving newtype (Functor, Applicative, Monad, MonadReader Config, MonadIO, MonadRandom)
+
+runM :: M a -> Config -> IO a
+runM (M m) = runReaderT m
 
 -- | Randomly draw a weight from the Pareto distribution with the given alpha.
 paretoWeight :: MonadRandom m => Double -> m Int
@@ -83,16 +98,18 @@ paretoWeight alpha = do
     u <- (1 -) <$> getRandomR (0, 1)
     return $ round $ recip $ u ** recip alpha
 
-mkPlayers :: Config -> [Double] -> IO [Player]
-mkPlayers cfg cs = do
-    let n   = cfgN cfg
-        k   = cfgK cfg
-        z0' = 1 / fromIntegral k
-        z0  = fromRational z0'
-        a0  = cfgA0 cfg
-        mw  = paretoWeight $ cfgParetoAlpha cfg
-    ws <- replicateM n mw
-    let potential lam c = (z0 + a0 * lam) / (1 + a0) - c
+mkPlayers :: M [Player]
+mkPlayers = do
+    n     <- asks cfgN
+    k     <- asks cfgK
+    a0    <- asks cfgA0
+    alpha <- asks cfgParetoAlpha
+    let z0' = 1 / fromIntegral k
+        z   = fromRational z0'
+        mw  = paretoWeight alpha
+    ws <- replicateM (fromIntegral n) mw
+    cs <- sampleRelCosts
+    let potential lam c = (z + a0 * lam) / (1 + a0) - c
         q               = fromIntegral (sum ws)
         ws'             = [fromIntegral w / q | w <- ws]
         wcs             = zip ws' cs
@@ -101,145 +118,184 @@ mkPlayers cfg cs = do
         ps              = uncurry Player <$> wcs'
     return ps
 
-pledge :: Natural  -- ^ number of ada holders
-       -> Natural  -- ^ pool count
-       -> Double   -- ^ days per epoch
-       -> Double   -- ^ ada in circulation
-       -> Double   -- ^ max supply of ada
-       -> Double   -- ^ monetary expansion
-       -> Double   -- ^ treasury ratio
-       -> Double   -- ^ dollars per ada
-       -> Double   -- ^ min cost dollars per year
-       -> Double   -- ^ Weibull scale
-       -> Double   -- ^ Weibull shape
-       -> Double   -- ^ Pareto alpha
-       -> Double   -- ^ whale threshold
-       -> Double   -- ^ pledge influence
-       -> IO ()
-pledge adaHolders poolCount daysPerEpoch adaInCirculation maxSupply expansionRatio treasuryRatio dollarsPerAda minCostDollarsPerYear weibullScale weibullShape paretoAlpha whaleThreshold a0  = do
-    cs <- map (dollarsPerYearToRelative . max minCostDollarsPerYear) <$> sampleCosts cfg
-    ps <- mkPlayers cfg cs
-
-    let nonWhales  = [p | p <- ps, plStake p < cfgWhaleThreshold cfg] -- remove whales from list of players
-        nonWhales' = unfoldr f nonWhales                              -- have players with higher-than-saturation stake split their stake
-        operators' = take (succ $ fromIntegral poolCount) nonWhales'  -- consider top (k+1) players
-        loser      = last operators'                                  -- (k+1)-st player
-        operators  = take (fromIntegral poolCount) operators'         -- pick top k players as pool operators
-        oms        = [(p, margin p loser) | p <- operators]           -- players and their ideal margin
-        richest    = maximumBy (compare `on` plStake) operators       -- richest pool operator
-        poorest    = minimumBy (compare `on` plStake) operators       -- poorest pool operator
-        middle     = operators !! div (cfgK cfg) 2                    -- middle pool operator
-        sybil      = sybilProtectionStake middle                      -- relative stake needed by a sybil attacker
+pledge :: M ()
+pledge = do
+    ps                    <- mkPlayers
+    poolCount             <- asks cfgK
+    adaHolders            <- asks cfgN
+    daysPerEpoch          <- asks cfgEpoch
+    adaInCirculation      <- asks cfgTotal
+    maxSupply             <- asks cfgSupply
+    expansionRatio        <- asks cfgExpansion
+    treasuryRatio         <- asks cfgTreasury
+    dollarsPerAda         <- asks cfgRate
+    minCostDollarsPerYear <- asks cfgMinCostPerYear
+    weibullScale          <- asks cfgWeibullScale
+    weibullShape          <- asks cfgWeibullShape
+    paretoAlpha           <- asks cfgParetoAlpha
+    whaleThreshold        <- asks cfgWhaleThreshold
+    a0                    <- asks cfgA0
+    let nonWhales  = [p | p <- ps, fromRational (plStake p) < whaleThreshold] -- remove whales from list of players
+    nonWhales' <- unfoldM f nonWhales                                         -- have players with higher-than-saturation stake split their stake
+    let operators' = take (succ $ fromIntegral poolCount) nonWhales'          -- consider top (k+1) players
+        loser      = last operators'                                          -- (k+1)-st player
+        operators  = take (fromIntegral poolCount) operators'                 -- pick top k players as pool operators
+    oms <- mapM (\p -> margin p loser >>= \m -> return (p, m)) operators      -- players and their ideal margin
+    let richest    = maximumBy (compare `on` plStake) operators               -- richest pool operator
+        poorest    = minimumBy (compare `on` plStake) operators               -- poorest pool operator
+        middle     = operators !! div (fromIntegral poolCount) 2              -- middle pool operator
+    sybil <- sybilProtectionStake middle                                      -- relative stake needed by a sybil attacker
+    richestA <- stakeToAda $ plStake richest
+    poorestA <- stakeToAda $ plStake poorest
+    sybilA   <- stakeToAda $ toRational sybil
+    richestD <- stakeToDollars $ plStake richest
+    poorestD <- stakeToDollars $ plStake poorest
+    sybilD   <- stakeToDollars $ toRational sybil
+    rewards  <- adaRewardsPerEpoch
 
     printOperators oms
-    printf "\n"
+    liftIO $ printf "\n"
 
-    printf "number of ada holders: %11d\n"   adaHolders
-    printf "number of pools:       %11d\n"   poolCount
-    printf "days per epoch:        %13.1f\n" daysPerEpoch
-    printf "ada in circulation:    %11.0f\n" adaInCirculation
-    printf "max supply of ada:     %11.0f\n" maxSupply
-    printf "monetary expansion:    %16.4f\n" expansionRatio
-    printf "treasury ratio:        %16.4f\n" treasuryRatio
-    printf "exchange rate ($/ada): %16.4f\n" dollarsPerAda
-    printf "min cost per year ($): %11.0f\n" minCostDollarsPerYear
-    printf "Weibull scale:         %11.0f\n" weibullScale
-    printf "Weibull shape:         %14.2f\n" weibullShape
-    printf "Pareto alpha:          %14.2f\n" paretoAlpha
-    printf "Whale threshold:       %16.4f\n" whaleThreshold
-    printf "pledge influence:      %14.2f\n" a0
-    printf "\n"
-    printf "number of whales:             %11d\n"   $ cfgN cfg - length nonWhales
-    printf "rewards per epoch (ada)           : %11.0f\n" $ adaRewardsPerEpoch
-    printf "richest pool operator stake (ada) : %11.0f\n" $ stakeToAda $ plStake richest
-    printf "poorest pool operator stake (ada) : %11.0f\n" $ stakeToAda $ plStake poorest
-    printf "sybil attacker min stake    (ada) : %11.0f\n" $ stakeToAda $ sybil
-    printf "richest pool operator stake ($)   : %11.0f\n" $ dollarsPerAda * stakeToAda (plStake richest)
-    printf "poorest pool operator stake ($)   : %11.0f\n" $ dollarsPerAda * stakeToAda (plStake poorest)
-    printf "sybil attacker min stake    ($)   : %11.0f\n" $ dollarsPerAda * stakeToAda sybil
+    liftIO $ printf "number of ada holders: %11d\n"   adaHolders
+    liftIO $ printf "number of pools:       %11d\n"   poolCount
+    liftIO $ printf "days per epoch:        %13.1f\n" daysPerEpoch
+    liftIO $ printf "ada in circulation:    %11.0f\n" adaInCirculation
+    liftIO $ printf "max supply of ada:     %11.0f\n" maxSupply
+    liftIO $ printf "monetary expansion:    %16.4f\n" expansionRatio
+    liftIO $ printf "treasury ratio:        %16.4f\n" treasuryRatio
+    liftIO $ printf "exchange rate ($/ada): %16.4f\n" dollarsPerAda
+    liftIO $ printf "min cost per year ($): %11.0f\n" minCostDollarsPerYear
+    liftIO $ printf "Weibull scale:         %11.0f\n" weibullScale
+    liftIO $ printf "Weibull shape:         %14.2f\n" weibullShape
+    liftIO $ printf "Pareto alpha:          %14.2f\n" paretoAlpha
+    liftIO $ printf "Whale threshold:       %16.4f\n" whaleThreshold
+    liftIO $ printf "pledge influence:      %14.2f\n" a0
+    liftIO $ printf "\n"
+    liftIO $ printf "number of whales:                   %11d\n"   $ fromIntegral adaHolders - length nonWhales
+    liftIO $ printf "rewards per epoch (ada)           : %11.0f\n" rewards
+    liftIO $ printf "richest pool operator stake (ada) : %11.0f\n" richestA
+    liftIO $ printf "poorest pool operator stake (ada) : %11.0f\n" poorestA
+    liftIO $ printf "sybil attacker min stake    (ada) : %11.0f\n" sybilA
+    liftIO $ printf "richest pool operator stake ($)   : %11.0f\n" richestD
+    liftIO $ printf "poorest pool operator stake ($)   : %11.0f\n" poorestD
+    liftIO $ printf "sybil attacker min stake    ($)   : %11.0f\n" sybilD
   where
-    cfg :: Config
-    cfg = Config
-        { cfgN              = fromIntegral adaHolders
-        , cfgK              = fromIntegral poolCount
-        , cfgA0             = a0
-        , cfgMinCost        = dollarsPerYearToRelative minCostDollarsPerYear
-        , cfgWeibullScale   = weibullScale
-        , cfgWeibullShape   = weibullShape
-        , cfgWhaleThreshold = toRational whaleThreshold
-        , cfgParetoAlpha    = paretoAlpha
-        }
-
-    sybilProtectionStake :: Player -> Rational
-    sybilProtectionStake p =
+    sybilProtectionStake :: Player -> M Rational
+    sybilProtectionStake p = do
+        k  <- fromIntegral <$> asks cfgK
+        mc <- asks cfgMinCostPerYear >>= dollarsPerYearToRelative
+        a0 <- asks cfgA0
         let l = fromRational $ plStake p
-            k = fromIntegral $ cfgK cfg
-        in  toRational $ (l - (plCost p - cfgMinCost cfg) * (1 + 1 / cfgA0 cfg)) * k / 2
+        return $ toRational $ (l - (plCost p - mc) * (1 + 1 / a0)) * k / 2
 
-    f :: [Player] -> Maybe (Player, [Player])
-    f []       = Nothing
-    f (p : ps)
-        | plStake p > z0 = Just (p {plStake = z0}, p {plStake = plStake p - z0} : ps)
-        | otherwise      = Just (p, ps)
+    f :: [Player] -> M (Maybe (Player, [Player]))
+    f []       = return Nothing
+    f (p : ps) = do
+        z <- z0
+        return $ Just $ if plStake p > z then (p {plStake = z}, p {plStake = plStake p - z} : ps)
+                                         else (p, ps)
 
-    z0 :: Rational
-    z0 = 1 / fromIntegral poolCount
-
-    epochsPerYear, adaRewardsPerEpoch :: Double
-    epochsPerYear      = 365 / daysPerEpoch
-    adaRewardsPerEpoch = (1 - treasuryRatio) * expansionRatio * (maxSupply - adaInCirculation)
-
-    dollarsToAda :: Double -> Double
-    dollarsToAda = (/ dollarsPerAda)
-
-    dollarsPerYearToRelative :: Double -> Double
-    dollarsPerYearToRelative d = dollarsToAda d / epochsPerYear / adaRewardsPerEpoch
-
-    relativeToDollarsPerYear :: Double -> Double
-    relativeToDollarsPerYear = (* (adaRewardsPerEpoch * epochsPerYear * dollarsPerAda))
-
-    stakeToAda :: Rational -> Double
-    stakeToAda = (* adaInCirculation) . fromRational
-
-    printOperators :: [(Player, Double)] -> IO ()
+    printOperators :: [(Player, Double)] -> M ()
     printOperators ps = do
-        printf "pool     pledge (ada)   cost per year ($)   pool rewards per epoch (ada) potential pool profit per epoch (ada)    margin  operator profit per epoch (ada)  ROI (percent)\n\n"
+        liftIO $ printf "pool     pledge (ada)   cost per year ($)   pool rewards per epoch (ada) potential pool profit per epoch (ada)    margin  operator profit per epoch (ada)  ROI (percent)\n\n"
         forM_ (zip [1 :: Int ..] ps) $ \(i, (p, m)) -> do
-            let stake = stakeToAda $ plStake p
-                cost  = relativeToDollarsPerYear $ plCost p
-                spr   = satPoolRewards (plStake p) * adaRewardsPerEpoch
-                ppp   = poolPotential p * adaRewardsPerEpoch
-                op    = operatorProfit p m * adaRewardsPerEpoch
-                roi   = 100 * op * epochsPerYear / (fromRational (plStake p) * adaInCirculation)
-            printf "%6d    %11.0f               %5.0f                       %8.0f                              %8.0f  %8.6f                         %8.0f          %5.2f\n" i stake cost spr ppp m op roi
+            stake <- stakeToAda $ plStake p
+            cost  <- relativeToDollarsPerYear $ plCost p
+            spr   <- (*) <$> adaRewardsPerEpoch <*> satPoolRewards (plStake p)
+            ppp   <- (*) <$> poolPotential p <*> adaRewardsPerEpoch
+            op    <- (*) <$> operatorProfit p m <*> adaRewardsPerEpoch
+            roi   <- do
+                e <- epochsPerYear
+                c <- asks cfgTotal
+                return $ 100 * op * e / (fromRational (plStake p) * c)
+            liftIO $ printf "%6d    %11.0f               %5.0f                       %8.0f                              %8.0f  %8.6f                         %8.0f          %5.2f\n" i stake cost spr ppp m op roi
 
-    -- | Rewards of a fully-saturated pool, given its pledge.
-    satPoolRewards :: Rational -> Double
-    satPoolRewards lam =
-        let lam' = fromRational $ min lam z0
-            beta = fromRational z0
-        in  1 / (1 + a0) * (beta + lam' * a0)
+epochsPerYear :: M Double
+epochsPerYear = (365 /) <$> asks cfgEpoch
 
-    -- | Potential (i.e. rewards minus costs) of a fully-saturate pool run by the given player.
-    poolPotential :: Player -> Double
-    poolPotential p = satPoolRewards (plStake p) - plCost p
+adaRewardsPerEpoch :: M Double
+adaRewardsPerEpoch = do
+    cfg <- ask
+    let t = cfgTreasury  cfg
+        e = cfgExpansion cfg
+        s = cfgSupply    cfg
+        c = cfgTotal     cfg
+    return $ (1 - t) * e * (s - c)
 
-    -- | Ideal margin for a player, given the next player below in the ranking.
-    margin :: Player -> Player -> Double
-    margin p q =
-        let potP = poolPotential p
-            potQ = poolPotential q
-        in  1 - potQ / potP
+dollarsToAda :: Double -> M Double
+dollarsToAda d = (d /) <$> asks cfgRate
 
-    -- | Profit for a pool operated by the given player with the given margin.
-    operatorProfit :: Player -> Double -> Double
-    operatorProfit p m =
-        let ppp = poolPotential p
-            x   = m * ppp
-            r   = (ppp - x) * fromRational (plStake p/ z0)
-        in  x + r
+dollarsPerYearToRelative :: Double -> M Double
+dollarsPerYearToRelative d = do
+    e <- epochsPerYear
+    r <- adaRewardsPerEpoch
+    a <- dollarsToAda d
+    return $ a / e / r
 
-sampleCosts :: Config -> IO [Double]
-sampleCosts cfg = do
-    rng <- newRNG mt19937
-    map (max $ cfgMinCost cfg) <$> replicateM (cfgN cfg) (getWeibull rng (cfgWeibullScale cfg) (cfgWeibullShape cfg))
+relativeToDollarsPerYear :: Double -> M Double
+relativeToDollarsPerYear r = do
+    a <- adaRewardsPerEpoch
+    e <- epochsPerYear
+    x <- asks cfgRate
+    return $ r * a * e * x
+
+z0 :: M Rational
+z0 = do
+    k <- asks cfgK
+    return $ 1 / fromIntegral k
+
+stakeToAda :: Rational -> M Double
+stakeToAda s = do
+    c <- asks cfgTotal
+    return $ c * fromRational s
+
+stakeToDollars :: Rational -> M Double
+stakeToDollars s = (*) <$> asks cfgRate <*> stakeToAda s
+
+sampleRelCosts :: M [Double]
+sampleRelCosts = do
+    rng <- liftIO $ newRNG mt19937
+    n   <- asks cfgN
+    sc  <- asks cfgWeibullScale
+    sh  <- asks cfgWeibullShape
+    mc  <- asks cfgMinCostPerYear
+    cs  <- map (max mc) <$> replicateM (fromIntegral n) (liftIO $ getWeibull rng sc sh)
+    mapM dollarsPerYearToRelative cs
+
+-- | Rewards of a fully-saturated pool, given its pledge.
+satPoolRewards :: Rational -> M Double
+satPoolRewards lam = do
+    z  <- z0
+    a0 <- asks cfgA0
+    let lam' = fromRational $ min lam z
+        beta = fromRational z
+    return $ 1 / (1 + a0) * (beta + lam' * a0)
+
+-- | Potential (i.e. rewards minus costs) of a fully-saturate pool run by the given player.
+poolPotential :: Player -> M Double
+poolPotential p = do
+    r <- satPoolRewards (plStake p)
+    return $ r - plCost p
+
+-- | Ideal margin for a player, given the next player below in the ranking.
+margin :: Player -> Player -> M Double
+margin p q = do
+    potP <- poolPotential p
+    potQ <- poolPotential q
+    return $ 1 - potQ / potP
+
+-- | Profit for a pool operated by the given player with the given margin.
+operatorProfit :: Player -> Double -> M Double
+operatorProfit p m = do
+    ppp <- poolPotential p
+    z   <- z0
+    let x = m * ppp
+        r = (ppp - x) * fromRational (plStake p/ z)
+    return $ x + r
+
+unfoldM :: Monad m => (b -> m (Maybe (a, b))) -> b -> m [a]
+unfoldM f b = do
+    m <- f b
+    case m of
+        Nothing      -> return []
+        Just (a, b') -> (a :) <$> unfoldM f b'
